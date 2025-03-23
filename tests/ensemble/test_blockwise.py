@@ -186,6 +186,27 @@ class TestBlockwiseVotingClassifier:
 
 
 class TestBlockwiseVotingRegressor:
+    def test_no_unnecessary_computation_in_fit(self, monkeypatch):
+        X, y = dask_ml.datasets.make_regression(n_features=20, chunks=25)
+        compute_called = False
+        original_compute = X.compute
+
+        def spy_compute(*args, **kwargs):
+            nonlocal compute_called
+            compute_called = True
+            return original_compute(*args, **kwargs)
+
+        monkeypatch.setattr(X, "compute", spy_compute)
+
+        est = dask_ml.ensemble.BlockwiseVotingRegressor(
+            sklearn.linear_model.LinearRegression(),
+        )
+        est.fit(X, y)
+        # Ensure that X.compute() was never invoked during fitting.
+        assert compute_called is False
+        # Verify that _n_samples was set using lazy metadata.
+        assert est._n_samples == X.shape[0]
+
     def test_fit_array(self):
         X, y = dask_ml.datasets.make_regression(n_features=20, chunks=25)
         est = dask_ml.ensemble.BlockwiseVotingRegressor(
@@ -240,3 +261,24 @@ class TestBlockwiseVotingRegressor:
         # TODO: r2_score raising for ndarray
         # score2 = est.score(X3, y3)
         # assert score == score2
+
+    def test_predict_with_different_chunks(self):
+        X, y = dask_ml.datasets.make_regression(n_features=20, chunks=25)
+        est = dask_ml.ensemble.BlockwiseVotingRegressor(
+            sklearn.linear_model.LinearRegression(),
+        )
+        est.fit(X, y)
+
+        X_test, y_test = dask_ml.datasets.make_regression(n_features=20, chunks=20)
+        result = est.predict(X_test)
+        assert result.dtype == np.dtype("float64")
+        assert result.shape == y_test.shape
+        # Prediction is rechunked to have one block per estimator.
+        assert result.numblocks[0] == len(est.estimators_)
+
+        score = est.score(X_test, y_test)
+        assert isinstance(score, float)
+
+        X_test_np, y_test_np = dask.compute(X_test, y_test)
+        result_np = est.predict(X_test_np)
+        da.utils.assert_eq(result, result_np)

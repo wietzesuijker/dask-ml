@@ -8,6 +8,18 @@ from ..base import ClassifierMixin, RegressorMixin
 from ..utils import check_array, is_frame_base
 
 
+def _safe_rechunk(arr, rechunk_dict, error_context=""):
+    """Helper function to safely rechunk arrays with proper error handling."""
+    try:
+        return arr.rechunk(rechunk_dict)
+    except Exception as e:
+        msg = (
+            "Failed to rechunk array"
+            f"{': ' + error_context if error_context else ''}: {e}"
+        )
+        raise ValueError(msg) from e
+
+
 class BlockwiseBase(sklearn.base.BaseEstimator):
     def __init__(self, estimator):
         self.estimator = estimator
@@ -22,6 +34,11 @@ class BlockwiseBase(sklearn.base.BaseEstimator):
 
     def fit(self, X, y, **kwargs):
         X = self._check_array(X)
+        try:
+            self._n_samples = X.shape[0]
+        except Exception:
+            self._n_samples = None
+
         estimatord = dask.delayed(self.estimator)
 
         Xs = X.to_delayed()
@@ -45,6 +62,7 @@ class BlockwiseBase(sklearn.base.BaseEstimator):
         ]
         results = list(dask.compute(*results))
         self.estimators_ = results
+        return self
 
     def _predict(self, X):
         """Collect results from many predict calls"""
@@ -54,6 +72,13 @@ class BlockwiseBase(sklearn.base.BaseEstimator):
             dtype = "float64"
 
         if isinstance(X, da.Array):
+            if hasattr(self, "_n_samples") and self._n_samples is not None:
+                desired = len(self.estimators_)
+                if X.numblocks[0] != desired:
+                    block_size = max(1, self._n_samples // desired)
+                    X = _safe_rechunk(
+                        X, {0: block_size}, "to match estimator partitioning"
+                    )
             chunks = (X.chunks[0], len(self.estimators_))
             combined = X.map_blocks(
                 _predict_stack,
@@ -174,6 +199,13 @@ class BlockwiseVotingClassifier(ClassifierMixin, BlockwiseBase):
 
     def _collect_probas(self, X):
         if isinstance(X, da.Array):
+            if hasattr(self, "_n_samples") and self._n_samples is not None:
+                desired = len(self.estimators_)
+                if X.numblocks[0] != desired:
+                    block_size = max(1, self._n_samples // desired)
+                    X = _safe_rechunk(
+                        X, {0: block_size}, "to match estimator partitioning"
+                    )
             chunks = (len(self.estimators_), X.chunks[0], len(self.classes_))
             meta = np.array([], dtype="float64")
             # (n_estimators, len(X), n_classes)
